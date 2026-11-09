@@ -30,4 +30,4 @@ go.work
 *.kubeconfig
 
 # Local project documents (plan and setup guide); not part of the repository
-/Docs/
+/init-doc/
