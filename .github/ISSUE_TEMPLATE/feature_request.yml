@@ -1,0 +1,53 @@
+name: Feature request
+description: A new behaviour or capability for Treebind
+title: "feat: "
+labels: ["kind/feature", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before the solution. Questions and early ideas
+        are welcome in Discussions first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Who is affected, what they do today, and why that is not enough.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would like Treebind to do. A sketch of the API or behaviour is enough.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, including doing nothing or using another tool.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Operator (controller, reconciler, CRD)
+        - Agent (sync loop, Git handling, volume probe)
+        - Adapters
+        - Packaging (images, Helm chart, release)
+        - Documentation
+        - Not sure
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched existing issues and Discussions for this idea
+          required: true
+        - label: I am willing to help build or test it
+          required: false

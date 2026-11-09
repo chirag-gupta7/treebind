@@ -1,0 +1,218 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [main]
+
+# Least privilege by default; a job asks for more only where it needs it.
+permissions:
+  contents: read
+
+# Pull requests cancel their own earlier runs. Runs on main never cancel.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Decides whether the slow end-to-end suite is needed. A pull request that
+  # touches only documentation and repository metadata skips it.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect code changes
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE...$HEAD" \
+            | grep -qvE '^(docs/|.*\.md$|LICENSE$|NOTICE$|\.github/(ISSUE_TEMPLATE/|CODEOWNERS$|pull_request_template\.md$))'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Check linter configuration
+        run: make lint-config
+
+      - name: Run linter
+        run: make lint
+
+      - name: Go module files are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Generated files are up to date
+        run: |
+          make generate manifests
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Generated files are out of date. Run 'make generate manifests' and commit the result."
+            git status --short
+            git diff
+            exit 1
+          fi
+
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # Everything except the cluster suites: envtest has its own job and
+      # test/e2e needs kind.
+      - name: Run unit tests
+        run: go test $(go list ./... | grep -v -e '/test/e2e' -e '/internal/controller')
+
+  envtest:
+    name: envtest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run reconciler tests against a real API server
+        run: make test
+
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # Binaries go to a scratch directory: with a single main package, a bare
+      # `go build ./cmd/...` would try to write a file called "cmd" over the
+      # cmd/ directory.
+      - name: Build every binary under cmd/
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: go build -o "$RUNNER_TEMP/bin/" ./cmd/...
+
+  # Every commit needs a Signed-off-by line. Dependabot does not add one, so
+  # its pull requests skip the job; a job skipped by its own condition counts
+  # as passing, which keeps the required check satisfied.
+  dco:
+    name: dco
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check sign-off on every commit in the pull request
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: hack/check-dco.sh "$BASE" "$HEAD"
+
+  # The pull request title becomes the commit on main (squash merge), so it
+  # must follow Conventional Commits. The title is passed through the
+  # environment, never interpolated into the script.
+  pr-title:
+    name: pr-title
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title format
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          pattern='^(feat|fix|docs|test|refactor|perf|build|ci|chore)(\((operator|agent|api|git|volume|lock|chart|adapters|ci|docs)\))?!?: .+$'
+          if [ "${#TITLE}" -gt 72 ]; then
+            echo "Title is ${#TITLE} characters; keep it within 72."
+            exit 1
+          fi
+          if ! printf '%s\n' "$TITLE" | grep -qE "$pattern"; then
+            echo "Title does not follow Conventional Commits:"
+            echo "  type(scope): short summary in the imperative"
+            echo "Types: feat, fix, docs, test, refactor, perf, build, ci, chore"
+            echo "Scopes: operator, agent, api, git, volume, lock, chart, adapters, ci, docs"
+            exit 1
+          fi
+
+  e2e:
+    name: e2e
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e.yml
+
+  # The only required check besides dco. A required job that a path filter
+  # skips would stay pending and block the merge; this gate treats a skipped
+  # job as passing and fails only on a failure or a cancellation.
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [changes, lint, unit, envtest, build, dco, pr-title, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any needed job failed or was cancelled
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            exit 1
+          fi

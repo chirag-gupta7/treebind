@@ -1,0 +1,16 @@
+changelog:
+  exclude:
+    labels: ["dependencies", "area/ci"]
+  categories:
+    - title: Breaking changes
+      labels: ["breaking-change"]
+    - title: Features
+      labels: ["kind/feature"]
+    - title: Bug fixes
+      labels: ["kind/bug"]
+    - title: Security
+      labels: ["area/security"]
+    - title: Documentation
+      labels: ["area/docs"]
+    - title: Other changes
+      labels: ["*"]

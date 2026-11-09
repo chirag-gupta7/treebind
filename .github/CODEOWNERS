@@ -1,0 +1,3 @@
+# Add owners per path when a second maintainer joins, then turn on code owner
+# review in the main ruleset.
+* @mohanedmoh

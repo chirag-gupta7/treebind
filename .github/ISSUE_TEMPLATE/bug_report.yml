@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in Treebind does not work as documented
+title: "bug: "
+labels: ["kind/bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not post credentials or tokens.
+        For a security problem, use the private advisory form instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you saw, and what you expected.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Treebind version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage behind the PVC
+      options:
+        - local-path / hostPath
+        - NFS
+        - CephFS / RBD
+        - AWS EFS / EBS
+        - Azure Files / Disk
+        - GCP Filestore / PD
+        - Other (say which below)
+    validations:
+      required: true
+  - type: input
+    id: cluster
+    attributes:
+      label: Kubernetes version and distribution
+      placeholder: "1.36, EKS, 3 nodes"
+    validations:
+      required: true
+  - type: textarea
+    id: treebind
+    attributes:
+      label: The Treebind resource
+      description: Output of kubectl get treebind NAME -o yaml, with secrets removed.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Operator and agent logs
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched existing issues for this problem
+          required: true
+        - label: I removed credentials from everything above
+          required: true

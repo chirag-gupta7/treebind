@@ -1,0 +1,74 @@
+name: Storage conformance report
+description: Share a storage class or cloud test result
+title: "conformance: "
+labels: ["kind/conformance-report", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports from real storage help decide which setups Treebind can
+        support. Run `make conformance STORAGE_CLASS=<name>` against a cluster
+        that uses the storage class, then paste the result below.
+        Do not post credentials, tokens or private hostnames.
+  - type: input
+    id: version
+    attributes:
+      label: Treebind version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: storage-class
+    attributes:
+      label: Storage class and provisioner
+      placeholder: "efs-sc (efs.csi.aws.com)"
+    validations:
+      required: true
+  - type: dropdown
+    id: access-modes
+    attributes:
+      label: Access mode used for the PVC
+      options:
+        - ReadWriteOnce
+        - ReadWriteMany
+        - ReadWriteOncePod
+        - ReadOnlyMany
+    validations:
+      required: true
+  - type: input
+    id: cluster
+    attributes:
+      label: Kubernetes version, distribution and cloud
+      placeholder: "1.36, EKS on AWS, 3 nodes"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      options:
+        - All checks passed
+        - Some checks failed
+        - The suite did not run to the end
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Conformance output
+      description: The full output of the suite.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Mount options, node types, network setup, or anything unusual.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed credentials and private hostnames from everything above
+          required: true
