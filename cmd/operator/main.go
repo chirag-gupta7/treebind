@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -37,7 +38,29 @@ import (
 
 	treebindv1alpha1 "github.com/mohanedmoh/treebind/api/v1alpha1"
 	"github.com/mohanedmoh/treebind/internal/controller"
+	"github.com/mohanedmoh/treebind/internal/statusclient"
 	// +kubebuilder:scaffold:imports
+)
+
+// defaultAgentImage is the sync agent image used when neither --agent-image nor
+// the AGENT_IMAGE environment variable sets one.
+const defaultAgentImage = "ghcr.io/mohanedmoh/treebind-agent:latest"
+
+// The timing of leader election. They are set here, and not left to the library's
+// defaults, because docs/operator-replicas.md states how long a failover takes and
+// that figure must not change with a library upgrade.
+//
+// A standby takes the lease over once it has seen no renewal for the lease
+// duration, so a leader that dies without releasing it is replaced after about
+// that long. A leader that can no longer renew gives up after the renew deadline,
+// which has to be shorter than the lease duration: the old leader has stopped
+// reconciling before a new one starts. client-go refuses to start with values that
+// break that order, and main_test.go checks them against the same rule. Every
+// candidate tries to acquire or renew the lease once per retry period.
+const (
+	leaderLeaseDuration = 15 * time.Second
+	leaderRenewDeadline = 10 * time.Second
+	leaderRetryPeriod   = 2 * time.Second
 )
 
 var (
@@ -52,6 +75,15 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// envOrDefault returns the value of the environment variable, or fallback when
+// it is unset or empty.
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
@@ -62,6 +94,8 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var agentImage string
+	var statusIssuer, statusSubject string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -82,6 +116,15 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&agentImage, "agent-image", envOrDefault("AGENT_IMAGE", defaultAgentImage),
+		"The image of the sync agent container. Defaults to the AGENT_IMAGE environment variable.")
+	flag.StringVar(&statusIssuer, "status-issuer", os.Getenv("STATUS_ISSUER"),
+		"The issuer of the cluster's service account tokens, which the sync agents check in the operator's token. "+
+			"Read from the API server when empty.")
+	flag.StringVar(&statusSubject, "status-subject", os.Getenv("STATUS_SUBJECT"),
+		"The operator's service account as its tokens name it, system:serviceaccount:<namespace>:<name>. "+
+			"Built from POD_NAMESPACE and POD_SERVICE_ACCOUNT when empty. The operator asks for tokens of this "+
+			"account to call the sync agents, and the Role in its namespace allows that for its own account only.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -158,35 +201,76 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// The manager takes the timings by pointer, and a constant has no address.
+	leaseDuration, renewDeadline, retryPeriod := leaderLeaseDuration, leaderRenewDeadline, leaderRetryPeriod
+
+	restConfig := ctrl.GetConfigOrDie()
+	get, err := apiGetter(restConfig)
+	if err != nil {
+		setupLog.Error(err, "Failed to connect to the API server")
+		os.Exit(1)
+	}
+	status, err := discoveredStatusSettings(get, statusSettings{Issuer: statusIssuer, Subject: statusSubject})
+	if err != nil {
+		setupLog.Error(err, "Failed to find out how the sync agents check the operator's token")
+		os.Exit(1)
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "c4984a8a.example.org",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		LeaseDuration:          &leaseDuration,
+		RenewDeadline:          &renewDeadline,
+		RetryPeriod:            &retryPeriod,
+		// The leader gives the lease up when the manager stops, so that a rolling
+		// update or a node drain hands over within a retry period and not after a
+		// full lease duration. Releasing is only safe when the process ends as soon
+		// as the manager returns, and it does: nothing runs after mgr.Start. The
+		// lease is released after the controllers have stopped, so the new leader
+		// never overlaps one that is still reconciling. A leader that is killed
+		// without time to stop cleanly does not release it, and the standby waits
+		// for the lease to run out.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
 
+	// One publisher serves both controllers, so that what it wrote is remembered once.
+	statusKeys := &controller.StatusKeyPublisher{Source: controller.NewKeyFetcher(controller.APIGetter(get))}
 	if err := (&controller.TreebindReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		AgentImage: agentImage,
+
+		StatusIssuer:  status.Issuer,
+		StatusSubject: status.Subject,
+		StatusKeys:    statusKeys,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "treebind")
+		os.Exit(1)
+	}
+
+	// The poller asks for tokens of the service account that the agents accept.
+	operatorNamespace, operatorAccount, err := serviceAccountOf(status.Subject)
+	if err != nil {
+		setupLog.Error(err, "Failed to find the service account to ask for tokens of")
+		os.Exit(1)
+	}
+	if err := (&controller.StatusPollerReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Agents: statusclient.New(&statusclient.ServiceAccountTokens{
+			Client: mgr.GetClient(), Namespace: operatorNamespace, ServiceAccount: operatorAccount,
+		}),
+		StatusKeys: statusKeys,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "treebind-status")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

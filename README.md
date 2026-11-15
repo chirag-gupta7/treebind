@@ -36,6 +36,25 @@ for the full setup.
 Which storage classes Treebind works on, and how that was tested, will be
 listed in the [storage support matrix](docs/storage-support.md).
 
+## Operator availability
+
+The operator runs as two replicas with leader election: one reconciles, and the
+other takes over within seconds if it goes away. How a failover works and how long
+it takes, where the replicas are placed, and how to run one replica for
+development are in [docs/operator-replicas.md](docs/operator-replicas.md).
+
+## Pod Security and file ownership
+
+Both pods run under the `restricted` Pod Security level. What they set, and what
+a volume that another user wrote to needs, is in
+[docs/pod-security.md](docs/pod-security.md).
+
+## Deleting a Treebind
+
+Deleting a Treebind removes its sync pod and Service. It never touches your
+volume or the data on it; see
+[docs/deleting-a-treebind.md](docs/deleting-a-treebind.md).
+
 ## Contributing
 
 Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and

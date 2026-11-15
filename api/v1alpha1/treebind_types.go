@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -47,6 +48,20 @@ const (
 	ConflictPolicyFollowLocal ConflictPolicy = "followLocal"
 )
 
+// PlacementMode says where the sync pod runs in relation to the application
+// that uses the volume.
+// +kubebuilder:validation:Enum=standalone;sidecar
+type PlacementMode string
+
+const (
+	// PlacementModeStandalone runs the sync pod on its own, next to the
+	// application's pods when the claim is ReadWriteOnce.
+	PlacementModeStandalone PlacementMode = "standalone"
+	// PlacementModeSidecar runs the sync container inside the application's own
+	// pods, which is how a ReadWriteOncePod claim can be shared.
+	PlacementModeSidecar PlacementMode = "sidecar"
+)
+
 // KeySelector names a key in a Secret or ConfigMap. The object is always in
 // the same namespace as the Treebind, so a Treebind cannot read another
 // namespace's data.
@@ -54,11 +69,13 @@ type KeySelector struct {
 	// name is the name of the Secret or ConfigMap.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name"`
 
 	// key is the key inside the Secret or ConfigMap that holds the value.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	Key string `json:"key"`
 }
 
@@ -67,31 +84,47 @@ type KeySelector struct {
 // reads their contents.
 type AuthSpec struct {
 	// sshKeySecretRef points to the Secret key that holds the private SSH key.
+	// It is required when the repository url uses ssh://.
 	// +optional
 	SSHKeySecretRef *KeySelector `json:"sshKeySecretRef,omitempty"`
 
 	// knownHostsConfigMapRef points to the ConfigMap key that holds the
-	// known_hosts entries used to verify the Git host.
+	// known_hosts entries used to verify the Git host. It is required when the
+	// repository url uses ssh://, because host keys are always verified.
 	// +optional
 	KnownHostsConfigMapRef *KeySelector `json:"knownHostsConfigMapRef,omitempty"`
 }
 
 // RepositorySpec describes the Git repository to sync with.
+// +kubebuilder:validation:XValidation:rule="!isURL(self.url) || url(self.url).getScheme() != 'ssh' || (has(self.auth) && has(self.auth.sshKeySecretRef) && has(self.auth.knownHostsConfigMapRef))",message="an ssh:// repository needs auth.sshKeySecretRef and auth.knownHostsConfigMapRef; host keys are always verified"
 type RepositorySpec struct {
 	// url is the address of the repository, for example
-	// ssh://git@github.com/acme/dashboards.git.
+	// ssh://git@github.com/acme/dashboards.git. The scheme must be explicit;
+	// the scp-style git@host:path shorthand is not accepted. Credentials never
+	// go in the URL: they are supplied through auth.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['ssh', 'https', 'http']",message="url must use an explicit ssh://, https:// or http:// scheme; scp-style host:path is not accepted"
+	// +kubebuilder:validation:XValidation:rule="!self.matches(r'[\\x00-\\x20\\x7f]')",message="url must not contain whitespace or control characters"
+	// +kubebuilder:validation:XValidation:rule="!self.matches('^[a-zA-Z][a-zA-Z0-9+.-]*://[^/@]*:[^/@]*@')",message="url must not embed a password; supply credentials through auth"
+	// +kubebuilder:validation:XValidation:rule="!self.matches('^https?://[^/]*@')",message="http and https urls must not embed credentials; supply credentials through auth"
 	URL string `json:"url"`
 
 	// branch is the branch to follow. The repository's default branch is used
 	// when it is empty.
 	// +optional
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:XValidation:rule="!self.contains('..') && !self.contains('@{') && !self.startsWith('-') && !self.startsWith('/') && !self.endsWith('.lock') && !self.endsWith('/')",message="branch must not contain '..' or '@{', start with '-' or '/', or end with '.lock' or '/'"
+	// +kubebuilder:validation:XValidation:rule="!self.matches(r'[\\x00-\\x20\\x7f~^:?*\\[\\\\]') && !self.contains('//') && self != '@' && !self.matches(r'(^|/)\\.') && !self.endsWith('.')",message="branch must not contain whitespace, control characters, '~', '^', ':', '?', '*', '[' or a backslash, nor '//', a component that starts with '.', or a trailing '.'"
 	Branch string `json:"branch,omitempty"`
 
 	// path is a directory inside the repository. Only that directory is synced
 	// with the volume. The whole repository is used when it is empty.
 	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('/') && self != '.' && !self.contains('\\\\') && !self.contains('//') && !('..' in self.split('/'))",message="path must be relative, must not be '.' and must not contain '..', '//' or a backslash"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/') && !('.' in self.split('/')) && !('.git' in self.split('/'))",message="path must not end with '/' or contain a '.' or '.git' segment"
 	Path string `json:"path,omitempty"`
 
 	// auth names the credentials for the repository.
@@ -99,22 +132,41 @@ type RepositorySpec struct {
 	Auth *AuthSpec `json:"auth,omitempty"`
 }
 
-// TargetSpec describes the volume the files live on.
+// TargetSpec describes the volume the files live on. claimName and subPath
+// are immutable because together they name the synced directory; retargeting
+// a live Treebind would mix the histories of two directories.
+// +kubebuilder:validation:XValidation:rule="self.claimName == oldSelf.claimName",message="claimName is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.subPath) == has(oldSelf.subPath) && (!has(self.subPath) || self.subPath == oldSelf.subPath)",message="subPath is immutable"
 type TargetSpec struct {
 	// claimName is the name of an existing PersistentVolumeClaim in the same
-	// namespace as the Treebind.
+	// namespace as the Treebind. It cannot be changed after creation.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	ClaimName string `json:"claimName"`
 
 	// subPath is a directory inside the claim. Only that directory is synced
-	// with the repository. The whole claim is used when it is empty.
+	// with the repository. The whole claim is used when it is empty. It cannot
+	// be changed after creation.
+	//
+	// The sync agent keeps its Git directory and the rest of its own state in a
+	// directory called .treebind at the root of the claim. With a subPath it is
+	// beside the synced directory, so an application that mounts the claim with
+	// the same subPath does not see it. Without one it is inside the synced
+	// directory, where the application can see it. So an application should mount
+	// only the subPath, and the subPath cannot start with .treebind.
 	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('/') && self != '.' && !self.contains('\\\\') && !self.contains('//') && !('..' in self.split('/'))",message="subPath must be relative, must not be '.' and must not contain '..', '//' or a backslash"
+	// +kubebuilder:validation:XValidation:rule="!self.endsWith('/') && !('.' in self.split('/')) && !('.git' in self.split('/'))",message="subPath must not end with '/' or contain a '.' or '.git' segment"
+	// +kubebuilder:validation:XValidation:rule="self.split('/')[0] != '.treebind'",message="subPath must not start with '.treebind', which the sync agent keeps for its own state"
 	SubPath string `json:"subPath,omitempty"`
 
 	// mountPath is where the claim is mounted inside the sync container. It
 	// does not affect where the application mounts the claim.
 	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:XValidation:rule="self.startsWith('/') && !('..' in self.split('/'))",message="mountPath must be an absolute path without '..'"
 	MountPath string `json:"mountPath,omitempty"`
 }
 
@@ -127,15 +179,24 @@ type SyncSpec struct {
 
 	// interval is how often the agent polls the repository for new commits.
 	// +optional
+	// +kubebuilder:default="30s"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1s')",message="interval must be at least 1s"
 	Interval *metav1.Duration `json:"interval,omitempty"`
 
 	// settleTime is the quiet period after the last local edit before the agent
 	// commits, so a file that is still being written is not committed half done.
 	// +optional
+	// +kubebuilder:default="5s"
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1s')",message="settleTime must be at least 1s"
 	SettleTime *metav1.Duration `json:"settleTime,omitempty"`
 
 	// conflictPolicy says which side wins when both changed the same file.
 	// +optional
+	// +kubebuilder:default=followRemote
 	ConflictPolicy ConflictPolicy `json:"conflictPolicy,omitempty"`
 }
 
@@ -161,13 +222,93 @@ type PathsSpec struct {
 	// the list is empty.
 	// +optional
 	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:items:XValidation:rule="!self.startsWith('/') && !('..' in self.split('/'))",message="patterns must be relative and must not contain '..'"
 	Include []string `json:"include,omitempty"`
 
 	// exclude lists the patterns of files to leave out, for example temporary
 	// and swap files.
 	// +optional
 	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:items:XValidation:rule="!self.startsWith('/') && !('..' in self.split('/'))",message="patterns must be relative and must not contain '..'"
 	Exclude []string `json:"exclude,omitempty"`
+}
+
+// PlacementSpec says where the sync pod runs. The field is accepted now and
+// takes effect once the placement work lands; until then the operator reports
+// a value that is not implemented in the SpecSupported condition.
+type PlacementSpec struct {
+	// mode is standalone to run the sync pod on its own, or sidecar to run the
+	// sync container inside the application's pods.
+	// +optional
+	// +kubebuilder:default=standalone
+	Mode PlacementMode `json:"mode,omitempty"`
+}
+
+// AgentSpec overrides how the sync pod is scheduled and run. Every field is
+// accepted now and takes effect once the placement work lands; until then the
+// operator ignores them and reports each one that is set in the SpecSupported
+// condition.
+type AgentSpec struct {
+	// resources are the compute resources of the sync container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// nodeSelector restricts the nodes the sync pod can run on.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=32
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// tolerations lets the sync pod run on nodes with matching taints.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=32
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// priorityClassName is the priority class of the sync pod.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	PriorityClassName string `json:"priorityClassName,omitempty"`
+
+	// imagePullSecrets names the Secrets in the Treebind's namespace used to
+	// pull the agent image.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:XValidation:rule="size(self.name) > 0",message="imagePullSecrets entries need a name"
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+
+	// labels are added to the sync pod.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=32
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// annotations are added to the sync pod.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=32
+	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// runAsUser is the user ID the sync container runs as.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
+
+	// runAsGroup is the group ID the sync container runs as.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+
+	// fsGroup is the group ID that owns the mounted volume, so the sync
+	// container can write to a claim that the application's user created.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	FSGroup *int64 `json:"fsGroup,omitempty"`
 }
 
 // TreebindSpec defines the desired state of Treebind.
@@ -191,6 +332,16 @@ type TreebindSpec struct {
 	// paths limits which files are synced.
 	// +optional
 	Paths *PathsSpec `json:"paths,omitempty"`
+
+	// placement says where the sync pod runs. It is defaulted as a whole so a
+	// Treebind without it reads back as standalone.
+	// +optional
+	// +kubebuilder:default={mode: standalone}
+	Placement PlacementSpec `json:"placement,omitzero"`
+
+	// agent overrides how the sync pod is scheduled and run.
+	// +optional
+	Agent *AgentSpec `json:"agent,omitempty"`
 }
 
 // TreebindStatus defines the observed state of Treebind.
@@ -210,16 +361,106 @@ type TreebindStatus struct {
 	LastSyncTime *metav1.Time `json:"lastSyncTime,omitempty"`
 
 	// conditions represent the current state of the Treebind resource. Each
-	// condition has a unique type and is set by the reconciler. The status of
-	// each condition is one of True, False, or Unknown.
+	// condition has a unique type. The status of each condition is one of True,
+	// False, or Unknown.
+	//
+	// SpecSupported and Ready are set by the reconciler. Synced and Conflict are
+	// set by the status poller from the sync agent's reports, and are Unknown
+	// until the first report arrives. AgentUnreachable is set by the status poller
+	// and says whether the operator can read the agent's report. It does not
+	// change Ready.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+const (
+	// ConditionSpecSupported is the type of the condition that says whether the
+	// operator implements every field set in the spec.
+	ConditionSpecSupported = "SpecSupported"
+
+	// ReasonSupported means every field set in the spec is implemented.
+	ReasonSupported = "Supported"
+	// ReasonNotImplemented means the spec sets a field that is accepted but
+	// not implemented yet, so the operator ignores it.
+	ReasonNotImplemented = "NotImplemented"
+
+	// ConditionReady is the type of the condition that says whether the sync
+	// pod is running and ready.
+	ConditionReady = "Ready"
+
+	// ReasonSyncPodReady means the sync StatefulSet reports its pod ready.
+	ReasonSyncPodReady = "SyncPodReady"
+	// ReasonSyncPodNotReady means the sync StatefulSet has no ready pod.
+	ReasonSyncPodNotReady = "SyncPodNotReady"
+	// ReasonNotSynced means the sync pod is ready but the volume is not in sync
+	// with the repository. The message names the reason of the Synced condition.
+	ReasonNotSynced = "NotSynced"
+	// ReasonReconcileFailed means the operator could not create or update the
+	// sync objects. The message carries the error, and the sync pod count says
+	// nothing until a reconcile succeeds.
+	ReasonReconcileFailed = "ReconcileFailed"
+
+	// ConditionSynced is the type of the condition that says whether the volume
+	// matches the repository at status.lastSyncedCommit.
+	ConditionSynced = "Synced"
+
+	// ConditionConflict is the type of the condition that says whether local work
+	// is parked and waits for someone to resolve it.
+	ConditionConflict = "Conflict"
+
+	// ReasonAwaitingAgentReport means the sync agent has not reported yet, so the
+	// condition is Unknown.
+	ReasonAwaitingAgentReport = "AwaitingAgentReport"
+
+	// ConditionAgentUnreachable is the type of the condition that says whether the
+	// operator can read the report of the sync agent. It is False while it can,
+	// True once it has not been able to for a few minutes, and Unknown while it
+	// cannot tell. It is about the operator's view of the agent and not about the
+	// sync: the sync can work while the operator cannot read it, so it never changes
+	// Ready.
+	ConditionAgentUnreachable = "AgentUnreachable"
+
+	// ReasonReportReceived means the agent answered with a report. The condition
+	// is False.
+	ReasonReportReceived = "ReportReceived"
+	// ReasonConnectionFailed means the connection to the sync pod was refused or
+	// nothing answered. The condition is True. A network policy or a service mesh
+	// that does not let the operator through looks like this.
+	ReasonConnectionFailed = "ConnectionFailed"
+	// ReasonTokenRefused means the agent answered 401 to the operator's token. The
+	// condition is True.
+	ReasonTokenRefused = "TokenRefused"
+	// ReasonUnexpectedResponse means the agent answered with a status that is
+	// neither a report nor a refusal. The condition is True.
+	ReasonUnexpectedResponse = "UnexpectedResponse"
+	// ReasonReportUnreadable means the agent answered with something that is not a
+	// report the operator can use. The condition is True.
+	ReasonReportUnreadable = "ReportUnreadable"
+	// ReasonPollFailing means the polls have been failing for less than the time
+	// it takes to call it. The condition is Unknown.
+	ReasonPollFailing = "PollFailing"
+	// ReasonAgentNotRunning means the name of the sync pod does not resolve, which
+	// is a pod that does not exist yet. The condition is Unknown, and Ready says
+	// more.
+	ReasonAgentNotRunning = "AgentNotRunning"
+	// ReasonTokenUnavailable means the operator could not get a token for the
+	// agent, which is not the agent's fault. The condition is Unknown.
+	ReasonTokenUnavailable = "TokenUnavailable"
+	// ReasonKeysUnavailable means the operator could not put the cluster's public
+	// keys where the agent reads them, so the agent refuses its token. The
+	// condition is Unknown.
+	ReasonKeysUnavailable = "KeysUnavailable"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Synced",type=string,JSONPath=`.status.conditions[?(@.type=="Synced")].status`
+// +kubebuilder:printcolumn:name="Conflict",type=string,JSONPath=`.status.conditions[?(@.type=="Conflict")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!has(self.metadata.name) || self.metadata.name.size() <= 56",message="metadata.name must be at most 56 characters, so the sync pod name, the name plus '-sync-0', fits the 63-character DNS label limit"
 
 // Treebind is the Schema for the treebinds API
 type Treebind struct {
